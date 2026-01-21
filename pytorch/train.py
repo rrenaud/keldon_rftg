@@ -27,6 +27,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 import numpy as np
 
 from rftg_net import RFTGNet, load_net_file
+from training_data import (
+    BinaryBatchReader, EVAL_INPUT_DIM, ROLE_INPUT_DIM, ROLE_BINARY_DIM, ROLE_FLOAT_DIM
+)
 from modern_nets import get_architecture, print_model_summary, ResidualMLP, UnifiedRFTGNet
 from training_utils import TargetNetwork, EMAModel
 
@@ -44,10 +47,14 @@ class RFTGEvalDataset(Dataset):
 
     def __init__(self, data_dirs: Union[str, List[str]], max_games: Optional[int] = None):
         """
-        Load eval training data from JSONL files.
+        Load eval training data from JSONL or NPZ files.
+
+        Automatically detects format based on file extensions:
+        - .npz files: Binary format (faster, smaller)
+        - .jsonl files: JSON format (legacy)
 
         Args:
-            data_dirs: Directory or list of directories containing worker_*.jsonl files
+            data_dirs: Directory or list of directories containing training files
             max_games: Maximum number of games to load (None = all)
         """
         self.inputs = []
@@ -61,37 +68,16 @@ class RFTGEvalDataset(Dataset):
 
         for data_dir in data_dirs:
             data_path = Path(data_dir)
-            for filepath in sorted(data_path.glob("*.jsonl")):
-                with open(filepath, 'r') as f:
-                    for line in f:
-                        if max_games and games_loaded >= max_games:
-                            break
-                        try:
-                            game = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
 
-                        # Get winner info
-                        num_players = game['num_players']
-                        winners = set(game['winner_indices'])
+            # Check for NPZ files first (preferred format)
+            npz_files = sorted(data_path.glob("*.npz"))
+            if npz_files:
+                games_loaded = self._load_from_npz(npz_files, max_games, games_loaded)
+            else:
+                # Fall back to JSONL format
+                jsonl_files = sorted(data_path.glob("*.jsonl"))
+                games_loaded = self._load_from_jsonl(jsonl_files, max_games, games_loaded)
 
-                        # Create target: 1.0 for winners, 0.0 for losers
-                        # Normalize so winners share the probability
-                        target = [1.0 / len(winners) if i in winners else 0.0
-                                  for i in range(num_players)]
-
-                        # Add each eval state with the game outcome as target
-                        for state in game['eval_states']:
-                            self.inputs.append(state['inputs'])
-                            # Rotate target to match player perspective
-                            player_idx = state['player_index']
-                            rotated_target = target[player_idx:] + target[:player_idx]
-                            self.targets.append(rotated_target)
-
-                        games_loaded += 1
-
-                if max_games and games_loaded >= max_games:
-                    break
             if max_games and games_loaded >= max_games:
                 break
 
@@ -99,6 +85,77 @@ class RFTGEvalDataset(Dataset):
         self.targets = torch.tensor(self.targets, dtype=torch.float32)
 
         print(f"Loaded {len(self.inputs)} eval states from {games_loaded} games")
+
+    def _load_from_npz(self, npz_files: List[Path], max_games: Optional[int], games_loaded: int) -> int:
+        """Load eval data from NPZ files."""
+        for filepath in npz_files:
+            if max_games and games_loaded >= max_games:
+                break
+
+            with BinaryBatchReader(str(filepath)) as reader:
+                # Get game info for targets
+                game_info = reader.get_game_info()
+                boundaries = reader.get_game_boundaries()
+                eval_inputs, eval_meta = reader.get_eval_data()
+
+                for i, info in enumerate(game_info):
+                    if max_games and games_loaded >= max_games:
+                        break
+
+                    # Get sample boundaries for this game
+                    eval_start = boundaries[i, 0]
+                    eval_end = boundaries[i + 1, 0] if i + 1 < len(boundaries) else len(eval_inputs)
+
+                    # Compute targets from game outcome
+                    num_players = info['num_players']
+                    winners = set(info['winner_indices'])
+                    target = [1.0 / len(winners) if j in winners else 0.0
+                              for j in range(num_players)]
+
+                    # Add samples for this game
+                    for j in range(eval_start, eval_end):
+                        self.inputs.append(eval_inputs[j].tolist())
+                        player_idx = int(eval_meta[j, 0])
+                        rotated_target = target[player_idx:] + target[:player_idx]
+                        self.targets.append(rotated_target)
+
+                    games_loaded += 1
+
+        return games_loaded
+
+    def _load_from_jsonl(self, jsonl_files: List[Path], max_games: Optional[int], games_loaded: int) -> int:
+        """Load eval data from JSONL files (legacy format)."""
+        for filepath in jsonl_files:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if max_games and games_loaded >= max_games:
+                        break
+                    try:
+                        game = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Get winner info
+                    num_players = game['num_players']
+                    winners = set(game['winner_indices'])
+
+                    # Create target: 1.0 for winners, 0.0 for losers
+                    target = [1.0 / len(winners) if i in winners else 0.0
+                              for i in range(num_players)]
+
+                    # Add each eval state with the game outcome as target
+                    for state in game['eval_states']:
+                        self.inputs.append(state['inputs'])
+                        player_idx = state['player_index']
+                        rotated_target = target[player_idx:] + target[:player_idx]
+                        self.targets.append(rotated_target)
+
+                    games_loaded += 1
+
+            if max_games and games_loaded >= max_games:
+                break
+
+        return games_loaded
 
     def __len__(self):
         return len(self.inputs)
@@ -112,10 +169,14 @@ class RFTGRoleDataset(Dataset):
 
     def __init__(self, data_dirs: Union[str, List[str]], max_games: Optional[int] = None):
         """
-        Load role training data from JSONL files.
+        Load role training data from JSONL or NPZ files.
+
+        Automatically detects format based on file extensions:
+        - .npz files: Binary format (faster, smaller)
+        - .jsonl files: JSON format (legacy)
 
         Args:
-            data_dirs: Directory or list of directories containing worker_*.jsonl files
+            data_dirs: Directory or list of directories containing training files
             max_games: Maximum number of games to load (None = all)
         """
         self.inputs = []
@@ -130,25 +191,16 @@ class RFTGRoleDataset(Dataset):
 
         for data_dir in data_dirs:
             data_path = Path(data_dir)
-            for filepath in sorted(data_path.glob("*.jsonl")):
-                with open(filepath, 'r') as f:
-                    for line in f:
-                        if max_games and games_loaded >= max_games:
-                            break
-                        try:
-                            game = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
 
-                        for decision in game['role_decisions']:
-                            self.inputs.append(decision['inputs'])
-                            self.chosen_actions.append(decision['chosen_action'])
-                            self.num_actions_list.append(len(decision['action_scores']))
+            # Check for NPZ files first (preferred format)
+            npz_files = sorted(data_path.glob("*.npz"))
+            if npz_files:
+                games_loaded = self._load_from_npz(npz_files, max_games, games_loaded)
+            else:
+                # Fall back to JSONL format
+                jsonl_files = sorted(data_path.glob("*.jsonl"))
+                games_loaded = self._load_from_jsonl(jsonl_files, max_games, games_loaded)
 
-                        games_loaded += 1
-
-                if max_games and games_loaded >= max_games:
-                    break
             if max_games and games_loaded >= max_games:
                 break
 
@@ -156,6 +208,61 @@ class RFTGRoleDataset(Dataset):
         self.chosen_actions = torch.tensor(self.chosen_actions, dtype=torch.long)
 
         print(f"Loaded {len(self.inputs)} role decisions from {games_loaded} games")
+
+    def _load_from_npz(self, npz_files: List[Path], max_games: Optional[int], games_loaded: int) -> int:
+        """Load role data from NPZ files."""
+        for filepath in npz_files:
+            if max_games and games_loaded >= max_games:
+                break
+
+            with BinaryBatchReader(str(filepath)) as reader:
+                # Get game boundaries and data
+                boundaries = reader.get_game_boundaries()
+                role_inputs = reader.get_full_role_inputs()  # Binary + floats concatenated
+                _, role_floats, role_meta = reader.get_role_data()
+
+                num_games_in_file = len(boundaries)
+                for i in range(num_games_in_file):
+                    if max_games and games_loaded >= max_games:
+                        break
+
+                    # Get sample boundaries for this game
+                    role_start = boundaries[i, 1]
+                    role_end = boundaries[i + 1, 1] if i + 1 < len(boundaries) else len(role_inputs)
+
+                    # Add samples for this game
+                    for j in range(role_start, role_end):
+                        self.inputs.append(role_inputs[j].tolist())
+                        self.chosen_actions.append(int(role_meta[j, 2]))
+                        self.num_actions_list.append(len(role_floats[j]))
+
+                    games_loaded += 1
+
+        return games_loaded
+
+    def _load_from_jsonl(self, jsonl_files: List[Path], max_games: Optional[int], games_loaded: int) -> int:
+        """Load role data from JSONL files (legacy format)."""
+        for filepath in jsonl_files:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if max_games and games_loaded >= max_games:
+                        break
+                    try:
+                        game = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    for decision in game['role_decisions']:
+                        self.inputs.append(decision['inputs'])
+                        self.chosen_actions.append(decision['chosen_action'])
+                        self.num_actions_list.append(len(decision['action_scores']))
+
+                    games_loaded += 1
+
+            if max_games and games_loaded >= max_games:
+                break
+
+        return games_loaded
 
     def __len__(self):
         return len(self.inputs)
@@ -640,10 +747,14 @@ class RFTGUnifiedDataset(Dataset):
 
     def __init__(self, data_dirs: Union[str, List[str]], max_games: Optional[int] = None):
         """
-        Load unified training data from JSONL files.
+        Load unified training data from JSONL or NPZ files.
+
+        Automatically detects format based on file extensions:
+        - .npz files: Binary format (faster, smaller)
+        - .jsonl files: JSON format (legacy)
 
         Args:
-            data_dirs: Directory or list of directories containing worker_*.jsonl files
+            data_dirs: Directory or list of directories containing training files
             max_games: Maximum number of games to load (None = all)
         """
         eval_inputs_raw = []
@@ -659,38 +770,22 @@ class RFTGUnifiedDataset(Dataset):
 
         for data_dir in data_dirs:
             data_path = Path(data_dir)
-            for filepath in sorted(data_path.glob("*.jsonl")):
-                with open(filepath, 'r') as f:
-                    for line in f:
-                        if max_games and games_loaded >= max_games:
-                            break
-                        try:
-                            game = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
 
-                        # Get winner info for eval targets
-                        num_players = game['num_players']
-                        winners = set(game['winner_indices'])
-                        target = [1.0 / len(winners) if i in winners else 0.0
-                                  for i in range(num_players)]
+            # Check for NPZ files first (preferred format)
+            npz_files = sorted(data_path.glob("*.npz"))
+            if npz_files:
+                games_loaded = self._load_from_npz(
+                    npz_files, max_games, games_loaded,
+                    eval_inputs_raw, policy_inputs_raw
+                )
+            else:
+                # Fall back to JSONL format
+                jsonl_files = sorted(data_path.glob("*.jsonl"))
+                games_loaded = self._load_from_jsonl(
+                    jsonl_files, max_games, games_loaded,
+                    eval_inputs_raw, policy_inputs_raw
+                )
 
-                        # Add eval states
-                        for state in game['eval_states']:
-                            eval_inputs_raw.append(state['inputs'])
-                            player_idx = state['player_index']
-                            rotated_target = target[player_idx:] + target[:player_idx]
-                            self.eval_targets.append(rotated_target)
-
-                        # Add policy decisions
-                        for decision in game['role_decisions']:
-                            policy_inputs_raw.append(decision['inputs'])
-                            self.policy_targets.append(decision['chosen_action'])
-
-                        games_loaded += 1
-
-                if max_games and games_loaded >= max_games:
-                    break
             if max_games and games_loaded >= max_games:
                 break
 
@@ -723,6 +818,91 @@ class RFTGUnifiedDataset(Dataset):
         self.num_inputs = self.max_input_dim
         self.num_value_outputs = self.eval_targets.shape[1]
         self.num_policy_outputs = self.policy_targets.max().item() + 1
+
+    def _load_from_npz(self, npz_files: List[Path], max_games: Optional[int], games_loaded: int,
+                       eval_inputs_raw: list, policy_inputs_raw: list) -> int:
+        """Load unified data from NPZ files."""
+        for filepath in npz_files:
+            if max_games and games_loaded >= max_games:
+                break
+
+            with BinaryBatchReader(str(filepath)) as reader:
+                # Get all data
+                game_info = reader.get_game_info()
+                boundaries = reader.get_game_boundaries()
+                eval_inputs, eval_meta = reader.get_eval_data()
+                role_inputs = reader.get_full_role_inputs()
+                _, _, role_meta = reader.get_role_data()
+
+                for i, info in enumerate(game_info):
+                    if max_games and games_loaded >= max_games:
+                        break
+
+                    # Get sample boundaries for this game
+                    eval_start = boundaries[i, 0]
+                    eval_end = boundaries[i + 1, 0] if i + 1 < len(boundaries) else len(eval_inputs)
+                    role_start = boundaries[i, 1]
+                    role_end = boundaries[i + 1, 1] if i + 1 < len(boundaries) else len(role_inputs)
+
+                    # Compute targets from game outcome
+                    num_players = info['num_players']
+                    winners = set(info['winner_indices'])
+                    target = [1.0 / len(winners) if j in winners else 0.0
+                              for j in range(num_players)]
+
+                    # Add eval samples
+                    for j in range(eval_start, eval_end):
+                        eval_inputs_raw.append(eval_inputs[j].tolist())
+                        player_idx = int(eval_meta[j, 0])
+                        rotated_target = target[player_idx:] + target[:player_idx]
+                        self.eval_targets.append(rotated_target)
+
+                    # Add policy samples
+                    for j in range(role_start, role_end):
+                        policy_inputs_raw.append(role_inputs[j].tolist())
+                        self.policy_targets.append(int(role_meta[j, 2]))
+
+                    games_loaded += 1
+
+        return games_loaded
+
+    def _load_from_jsonl(self, jsonl_files: List[Path], max_games: Optional[int], games_loaded: int,
+                         eval_inputs_raw: list, policy_inputs_raw: list) -> int:
+        """Load unified data from JSONL files (legacy format)."""
+        for filepath in jsonl_files:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if max_games and games_loaded >= max_games:
+                        break
+                    try:
+                        game = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Get winner info for eval targets
+                    num_players = game['num_players']
+                    winners = set(game['winner_indices'])
+                    target = [1.0 / len(winners) if i in winners else 0.0
+                              for i in range(num_players)]
+
+                    # Add eval states
+                    for state in game['eval_states']:
+                        eval_inputs_raw.append(state['inputs'])
+                        player_idx = state['player_index']
+                        rotated_target = target[player_idx:] + target[:player_idx]
+                        self.eval_targets.append(rotated_target)
+
+                    # Add policy decisions
+                    for decision in game['role_decisions']:
+                        policy_inputs_raw.append(decision['inputs'])
+                        self.policy_targets.append(decision['chosen_action'])
+
+                    games_loaded += 1
+
+            if max_games and games_loaded >= max_games:
+                break
+
+        return games_loaded
 
     def __len__(self):
         # Return length of the smaller dataset
