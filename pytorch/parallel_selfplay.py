@@ -24,6 +24,59 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 import random
 
+from training_data import GameRecord, BinaryBatchWriter
+import json
+
+
+def convert_batch_to_binary(batch_dir: str, delete_jsonl: bool = True) -> Dict[str, Any]:
+    """
+    Convert a batch directory from JSONL to NPZ format.
+
+    Args:
+        batch_dir: Directory containing worker_*.jsonl files
+        delete_jsonl: Whether to delete JSONL files after conversion
+
+    Returns:
+        Conversion statistics
+    """
+    batch_path = Path(batch_dir)
+    jsonl_files = sorted(batch_path.glob("*.jsonl"))
+
+    if not jsonl_files:
+        return {'error': 'No JSONL files found'}
+
+    output_path = batch_path / "batch.npz"
+    writer = BinaryBatchWriter(str(output_path))
+
+    stats = {
+        'num_files': len(jsonl_files),
+        'num_games': 0,
+        'input_size': 0,
+    }
+
+    for jsonl_path in jsonl_files:
+        stats['input_size'] += os.path.getsize(jsonl_path)
+        # Read plain JSONL files (not gzipped) from the C learner
+        with open(jsonl_path, 'r') as f:
+            for line in f:
+                if line.strip():
+                    game = GameRecord.from_dict(json.loads(line))
+                    writer.add_game(game)
+                    stats['num_games'] += 1
+
+    writer.write()
+
+    stats['output_size'] = os.path.getsize(output_path)
+    stats['compression_ratio'] = stats['input_size'] / stats['output_size'] if stats['output_size'] > 0 else 0
+
+    # Delete JSONL files if requested
+    if delete_jsonl:
+        for f in jsonl_files:
+            os.remove(f)
+        stats['deleted_files'] = len(jsonl_files)
+
+    return stats
+
 
 def find_learner_binary() -> Optional[Path]:
     """Find the learner binary."""
@@ -155,7 +208,8 @@ def run_parallel_selfplay(
     advanced: bool = False,
     base_seed: Optional[int] = None,
     output_dir: Optional[str] = None,
-    verbose: bool = False
+    verbose: bool = False,
+    output_format: str = 'jsonl',
 ) -> Dict[str, Any]:
     """
     Run self-play in parallel across multiple workers.
@@ -169,6 +223,7 @@ def run_parallel_selfplay(
         base_seed: Base random seed (workers use base_seed + worker_id)
         output_dir: Directory to save output (optional)
         verbose: Print verbose output
+        output_format: Output format ('jsonl' or 'binary')
 
     Returns:
         Dict with aggregate results
@@ -259,6 +314,19 @@ def run_parallel_selfplay(
         print(f"Output files: {len(output_files)} files, {total_size / 1024 / 1024:.1f} MB total")
         print(f"Output directory: {output_dir}")
 
+    # Convert to binary format if requested
+    npz_file = None
+    if output_format == 'binary' and output_dir and output_files:
+        print("Converting to binary format...")
+        conv_stats = convert_batch_to_binary(output_dir, delete_jsonl=True)
+        if 'error' not in conv_stats:
+            npz_file = os.path.join(output_dir, "batch.npz")
+            print(f"Converted: {conv_stats['input_size'] / 1024 / 1024:.1f} MB -> "
+                  f"{conv_stats['output_size'] / 1024 / 1024:.1f} MB "
+                  f"({conv_stats['compression_ratio']:.1f}x compression)")
+        else:
+            print(f"Conversion failed: {conv_stats['error']}")
+
     return {
         'num_workers': num_workers,
         'successful_workers': len(successful),
@@ -266,7 +334,7 @@ def run_parallel_selfplay(
         'total_elapsed': total_elapsed,
         'games_per_sec': total_games / total_elapsed,
         'worker_results': results,
-        'output_files': output_files,
+        'output_files': output_files if output_format == 'jsonl' else ([npz_file] if npz_file else []),
     }
 
 
@@ -277,7 +345,8 @@ def run_continuous_selfplay(
     expansion: int = 0,
     advanced: bool = False,
     output_dir: str = "./training_data",
-    verbose: bool = False
+    verbose: bool = False,
+    output_format: str = 'jsonl',
 ):
     """
     Run self-play continuously until interrupted.
@@ -361,17 +430,23 @@ def run_continuous_selfplay(
             total_games += batch_games
             total_time = time.time() - start_time
 
-            # Get batch size
-            batch_size = sum(
-                os.path.getsize(os.path.join(batch_dir, f))
-                for f in os.listdir(batch_dir) if f.endswith('.jsonl')
-            )
+            # Convert to binary format if requested
+            if output_format == 'binary':
+                conv_stats = convert_batch_to_binary(batch_dir, delete_jsonl=True)
+                batch_size = conv_stats.get('output_size', 0)
+                file_ext = '.npz'
+            else:
+                batch_size = sum(
+                    os.path.getsize(os.path.join(batch_dir, f))
+                    for f in os.listdir(batch_dir) if f.endswith('.jsonl')
+                )
+                file_ext = '.jsonl'
 
             # Get total size
             total_size = 0
             for root, dirs, files in os.walk(output_dir):
                 for f in files:
-                    if f.endswith('.jsonl'):
+                    if f.endswith(file_ext):
                         total_size += os.path.getsize(os.path.join(root, f))
 
             print(f"[Batch {batch_num}] Completed: {batch_games} games in {batch_elapsed:.1f}s "
@@ -447,6 +522,13 @@ def main():
         action="store_true",
         help="Run continuously until Ctrl+C (uses --games-per-worker as batch size)"
     )
+    parser.add_argument(
+        "--format", "-f",
+        type=str,
+        choices=["jsonl", "binary"],
+        default="jsonl",
+        help="Output format: 'jsonl' (legacy) or 'binary' (NPZ, ~57x smaller)"
+    )
 
     args = parser.parse_args()
 
@@ -461,7 +543,8 @@ def main():
                 expansion=args.expansion,
                 advanced=args.advanced,
                 output_dir=args.output_dir,
-                verbose=args.verbose
+                verbose=args.verbose,
+                output_format=args.format,
             )
         else:
             results = run_parallel_selfplay(
@@ -472,7 +555,8 @@ def main():
                 advanced=args.advanced,
                 base_seed=args.seed,
                 output_dir=args.output_dir,
-                verbose=args.verbose
+                verbose=args.verbose,
+                output_format=args.format,
             )
             sys.exit(0 if results['successful_workers'] == results['num_workers'] else 1)
     except FileNotFoundError as e:
