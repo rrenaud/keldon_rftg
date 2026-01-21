@@ -1158,6 +1158,13 @@ extern void ai_debug(game *g, double win_prob[MAX_PLAYER][MAX_PLAYER],
                               double *role[], double *action_score[],
                               int *num_action);
 
+/* Training data export functions */
+extern void ai_enable_export(const char *filename);
+extern void ai_disable_export(void);
+extern void ai_export_start_game(unsigned int seed, int expansion, int num_players, int advanced);
+extern void ai_export_set_round(int round);
+extern void ai_export_end_game(int *final_scores, int *winners, int num_players);
+
 extern int load_game(game *g, char *filename);
 extern int save_game(game *g, char *filename, int player_us);
 extern void write_game(game *g, FILE *fff, int player_us);

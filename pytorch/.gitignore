@@ -1,0 +1,27 @@
+# Training data (too large)
+training_data/
+
+# Trained models (too large)
+trained_models/
+
+# Wandb logs
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Compiled binaries
+export_test_vectors
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

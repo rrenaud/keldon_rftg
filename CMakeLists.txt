@@ -60,15 +60,26 @@ if(BUILD_TESTING)
   FetchContent_MakeAvailable(Catch2)
 endif()
 
+# Option to build with GTK GUI support
+option(BUILD_GUI "Build GTK GUI components" OFF)
+# Option to build server (requires MySQL)
+option(BUILD_SERVER "Build server (requires MySQL)" OFF)
+
 # LIBRARIES
 add_subdirectory(net)
 add_subdirectory(rftg)
 add_subdirectory(comm)
-add_subdirectory(client)
+if(BUILD_GUI)
+  add_subdirectory(client)
+endif()
 
 # EXECUTABLES
-add_subdirectory(gui)
-add_subdirectory(server)
+if(BUILD_GUI)
+  add_subdirectory(gui)
+endif()
+if(BUILD_SERVER)
+  add_subdirectory(server)
+endif()
 add_subdirectory(ai_client)
 add_subdirectory(learner)
 add_subdirectory(dumpnet)

@@ -31,6 +31,229 @@
  */
 static int num_computes;
 
+/*
+ * Training data export functionality.
+ * When enabled, writes neural network inputs/outputs to a file
+ * for use with external training (e.g., PyTorch).
+ * Data is buffered in memory and written at game end to handle
+ * interleaved eval/role operations.
+ */
+static int export_enabled = 0;
+static FILE *export_file = NULL;
+static int export_game_started = 0;
+static int export_round = 0;
+
+/* Game metadata for export */
+static unsigned int export_seed;
+static int export_expansion;
+static int export_num_players;
+static int export_advanced;
+
+/* Buffered eval states */
+#define MAX_EXPORT_EVAL 500
+static double *export_eval_inputs[MAX_EXPORT_EVAL];
+static int export_eval_player[MAX_EXPORT_EVAL];
+static int export_eval_round[MAX_EXPORT_EVAL];
+static int export_num_eval = 0;
+static int export_eval_input_size = 0;
+
+/* Buffered role decisions */
+#define MAX_EXPORT_ROLE 200
+#define MAX_ROLE_ACTIONS 100
+static double *export_role_inputs[MAX_EXPORT_ROLE];
+static int export_role_player[MAX_EXPORT_ROLE];
+static int export_role_round[MAX_EXPORT_ROLE];
+static int export_role_chosen[MAX_EXPORT_ROLE];
+static double export_role_scores[MAX_EXPORT_ROLE][MAX_ROLE_ACTIONS];
+static int export_role_num_actions[MAX_EXPORT_ROLE];
+static int export_num_role = 0;
+static int export_role_input_size = 0;
+
+/* Forward declarations - implemented after eval/role are declared */
+static void export_eval_state(int player);
+static void export_role_decision(int player, int chosen, double *scores, int num_actions);
+
+/*
+ * Enable training data export.
+ */
+void ai_enable_export(const char *filename)
+{
+	export_file = fopen(filename, "w");
+	if (export_file)
+	{
+		export_enabled = 1;
+	}
+}
+
+/*
+ * Disable training data export.
+ */
+void ai_disable_export(void)
+{
+	int i;
+
+	/* Free any allocated input buffers */
+	for (i = 0; i < export_num_eval; i++)
+	{
+		if (export_eval_inputs[i])
+		{
+			free(export_eval_inputs[i]);
+			export_eval_inputs[i] = NULL;
+		}
+	}
+	for (i = 0; i < export_num_role; i++)
+	{
+		if (export_role_inputs[i])
+		{
+			free(export_role_inputs[i]);
+			export_role_inputs[i] = NULL;
+		}
+	}
+
+	if (export_file)
+	{
+		fclose(export_file);
+		export_file = NULL;
+	}
+	export_enabled = 0;
+}
+
+/*
+ * Start a new game for export.
+ */
+void ai_export_start_game(unsigned int seed, int expansion, int num_players, int advanced)
+{
+	int i;
+
+	if (!export_enabled || !export_file) return;
+
+	/* Store game metadata */
+	export_seed = seed;
+	export_expansion = expansion;
+	export_num_players = num_players;
+	export_advanced = advanced;
+
+	/* Free any previous buffers */
+	for (i = 0; i < export_num_eval; i++)
+	{
+		if (export_eval_inputs[i])
+		{
+			free(export_eval_inputs[i]);
+			export_eval_inputs[i] = NULL;
+		}
+	}
+	for (i = 0; i < export_num_role; i++)
+	{
+		if (export_role_inputs[i])
+		{
+			free(export_role_inputs[i]);
+			export_role_inputs[i] = NULL;
+		}
+	}
+
+	/* Reset counters */
+	export_num_eval = 0;
+	export_num_role = 0;
+	export_round = 0;
+
+	export_game_started = 1;
+}
+
+/*
+ * Record current round number.
+ */
+void ai_export_set_round(int round)
+{
+	export_round = round;
+}
+
+/*
+ * Helper to print double array as JSON.
+ */
+static void export_print_doubles(FILE *f, double *arr, int len)
+{
+	int i;
+	fprintf(f, "[");
+	for (i = 0; i < len; i++)
+	{
+		fprintf(f, "%.9g", arr[i]);
+		if (i < len - 1) fprintf(f, ",");
+	}
+	fprintf(f, "]");
+}
+
+/*
+ * End game export with outcome.
+ * Writes all buffered data to file.
+ */
+void ai_export_end_game(int *final_scores, int *winners, int num_players)
+{
+	int i, first;
+
+	if (!export_enabled || !export_file || !export_game_started) return;
+
+	/* Start JSON object */
+	fprintf(export_file, "{\"random_seed\":%u,\"expansion\":%d,\"num_players\":%d,\"advanced\":%s,",
+	        export_seed, export_expansion, export_num_players, export_advanced ? "true" : "false");
+
+	/* Write eval states */
+	fprintf(export_file, "\"eval_states\":[");
+	for (i = 0; i < export_num_eval; i++)
+	{
+		if (i > 0) fprintf(export_file, ",");
+		fprintf(export_file, "{\"player_index\":%d,\"round_num\":%d,\"inputs\":",
+		        export_eval_player[i], export_eval_round[i]);
+		export_print_doubles(export_file, export_eval_inputs[i], export_eval_input_size);
+		fprintf(export_file, "}");
+	}
+	fprintf(export_file, "],");
+
+	/* Write role decisions */
+	fprintf(export_file, "\"role_decisions\":[");
+	for (i = 0; i < export_num_role; i++)
+	{
+		if (i > 0) fprintf(export_file, ",");
+		fprintf(export_file, "{\"player_index\":%d,\"round_num\":%d,\"chosen_action\":%d,\"inputs\":",
+		        export_role_player[i], export_role_round[i], export_role_chosen[i]);
+		export_print_doubles(export_file, export_role_inputs[i], export_role_input_size);
+		fprintf(export_file, ",\"action_scores\":");
+		export_print_doubles(export_file, export_role_scores[i], export_role_num_actions[i]);
+		fprintf(export_file, "}");
+	}
+	fprintf(export_file, "],");
+
+	/* Add final scores */
+	fprintf(export_file, "\"final_scores\":[");
+	for (i = 0; i < num_players; i++)
+	{
+		fprintf(export_file, "%d", final_scores[i]);
+		if (i < num_players - 1) fprintf(export_file, ",");
+	}
+	fprintf(export_file, "],");
+
+	/* Add winner indices */
+	fprintf(export_file, "\"winner_indices\":[");
+	first = 1;
+	for (i = 0; i < num_players; i++)
+	{
+		if (winners[i])
+		{
+			if (!first) fprintf(export_file, ",");
+			fprintf(export_file, "%d", i);
+			first = 0;
+		}
+	}
+	fprintf(export_file, "],");
+
+	fprintf(export_file, "\"num_rounds\":%d", export_round);
+
+	/* Close game object */
+	fprintf(export_file, "}\n");
+	fflush(export_file);
+
+	export_game_started = 0;
+}
+
 
 /*
  * A neural net for evaluating hand and active cards.
@@ -49,6 +272,72 @@ static int role_hit, role_miss;
 static double role_avg;
 
 static int eval_cache_hit, eval_cache_miss;
+
+/*
+ * Export an eval state (called after store_net for eval network).
+ * Buffers the data for output at game end.
+ */
+static void export_eval_state(int player)
+{
+	int idx;
+
+	if (!export_enabled || !export_file || !export_game_started) return;
+	if (export_num_eval >= MAX_EXPORT_EVAL) return;
+
+	/* Store input size on first call */
+	if (export_eval_input_size == 0)
+	{
+		export_eval_input_size = eval.num_inputs;
+	}
+
+	idx = export_num_eval;
+
+	/* Allocate and copy input values */
+	export_eval_inputs[idx] = (double *)malloc(sizeof(double) * eval.num_inputs);
+	memcpy(export_eval_inputs[idx], eval.input_value, sizeof(double) * eval.num_inputs);
+
+	/* Store metadata */
+	export_eval_player[idx] = player;
+	export_eval_round[idx] = export_round;
+
+	export_num_eval++;
+}
+
+/*
+ * Export a role decision (called during role training).
+ * Buffers the data for output at game end.
+ */
+static void export_role_decision(int player, int chosen, double *scores, int num_actions)
+{
+	int idx;
+
+	if (!export_enabled || !export_file || !export_game_started) return;
+	if (export_num_role >= MAX_EXPORT_ROLE) return;
+	if (num_actions > MAX_ROLE_ACTIONS) num_actions = MAX_ROLE_ACTIONS;
+
+	/* Store input size on first call */
+	if (export_role_input_size == 0)
+	{
+		export_role_input_size = role.num_inputs;
+	}
+
+	idx = export_num_role;
+
+	/* Allocate and copy input values */
+	export_role_inputs[idx] = (double *)malloc(sizeof(double) * role.num_inputs);
+	memcpy(export_role_inputs[idx], role.input_value, sizeof(double) * role.num_inputs);
+
+	/* Copy scores */
+	memcpy(export_role_scores[idx], scores, sizeof(double) * num_actions);
+
+	/* Store metadata */
+	export_role_player[idx] = player;
+	export_role_round[idx] = export_round;
+	export_role_chosen[idx] = chosen;
+	export_role_num_actions[idx] = num_actions;
+
+	export_num_role++;
+}
 
 /*
  * Size of evaluator neural net.
@@ -2575,6 +2864,9 @@ static void perform_training(game *g, int who, double *desired)
 	/* Store current inputs */
 	store_net(&eval, who);
 
+	/* Export eval state if enabled */
+	export_eval_state(who);
+
 	/* Check for passed in results */
 	if (desired)
 	{
@@ -3769,6 +4061,9 @@ static void ai_choose_action_advanced(game *g, int who, int action[2], int one)
 		desired[i] = exp(20 * (scores[i] / b_s)) / sum;
 	}
 
+	/* Export role decision if enabled */
+	export_role_decision(who, b_a, scores, role.num_output);
+
 	/* Train network */
 	train_net(&role, 1.0, desired);
 
@@ -4263,6 +4558,9 @@ static void ai_choose_action(game *g, int who, int action[2], int one)
 		/* Compute probability ratio */
 		desired[i] = exp(20 * (scores[i] / b_s)) / sum;
 	}
+
+	/* Export role decision if enabled */
+	export_role_decision(who, best, scores, role.num_output);
 
 	/* Train network */
 	train_net(&role, 1.0, desired);

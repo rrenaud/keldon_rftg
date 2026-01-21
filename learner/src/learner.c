@@ -74,6 +74,9 @@ int main(int argc, char *argv[])
 	int expansion = 0, advanced = 0, promo = 0;
 	char buf[1024], *names[MAX_PLAYER];
 	double factor = 1.0;
+	char *export_file = NULL;
+	int round_num;
+	int final_scores[MAX_PLAYER], winners[MAX_PLAYER];
 
 	/* Set random seed */
 	my_game.random_seed = time(NULL);
@@ -143,6 +146,19 @@ int main(int argc, char *argv[])
 			/* Set factor */
 			factor = atof(argv[++i]);
 		}
+
+		/* Check for export file */
+		else if (!strcmp(argv[i], "-x"))
+		{
+			/* Set export filename */
+			export_file = argv[++i];
+		}
+	}
+
+	/* Enable export if filename given */
+	if (export_file)
+	{
+		ai_enable_export(export_file);
 	}
 
 	/* Set number of players */
@@ -196,11 +212,19 @@ int main(int argc, char *argv[])
 
 		printf("Start seed: %u\n", my_game.start_seed);
 
+		/* Start export for this game */
+		ai_export_start_game(my_game.start_seed, expansion, num_players, advanced);
+
 		/* Begin game */
 		begin_game(&my_game);
 
 		/* Play game rounds until finished */
-		while (game_round(&my_game));
+		round_num = 0;
+		while (game_round(&my_game))
+		{
+			round_num++;
+			ai_export_set_round(round_num);
+		}
 
 		/* Score game */
 		score_game(&my_game);
@@ -215,6 +239,16 @@ int main(int argc, char *argv[])
 
 		/* Declare winner */
 		declare_winner(&my_game);
+
+		/* Collect final scores and winners for export */
+		for (j = 0; j < num_players; j++)
+		{
+			final_scores[j] = my_game.p[j].end_vp;
+			winners[j] = my_game.p[j].winner;
+		}
+
+		/* Export game end data */
+		ai_export_end_game(final_scores, winners, num_players);
 
 		/* Call player game over functions */
 		for (j = 0; j < num_players; j++)
@@ -240,6 +274,12 @@ int main(int argc, char *argv[])
 	{
 		/* Call shutdown function */
 		my_game.p[i].control->shutdown(&my_game, i);
+	}
+
+	/* Disable export if enabled */
+	if (export_file)
+	{
+		ai_disable_export();
 	}
 
 	/* Done */
